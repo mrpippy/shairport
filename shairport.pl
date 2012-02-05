@@ -287,15 +287,17 @@ if ($avahi_publish==0) {
 my $airport_pem = join '', <DATA>;
 my $rsa = Crypt::OpenSSL::RSA->new_private_key($airport_pem) || die "RSA private key import failed";
 
-my $listen;
+my $listen6;
+my $listen4;
 {
     eval {
         local $SIG{__DIE__};
-        $listen = new IO::Socket::INET6(Listen => 1,
+        $listen6 = new IO::Socket::INET6(Listen => 1,
                             Domain => AF_INET6,
                             LocalPort => $port,
                             ReuseAddr => 1,
                             Proto => 'tcp');
+    	setsockopt($listen6, getprotobyname("ipv6"), 27, 1);
     };
     if ($@) {
         print "**************************************\n",
@@ -304,12 +306,12 @@ my $listen;
               "**************************************\n\n";
     }
 
-    $listen ||= new IO::Socket::INET(Listen => 1,
+    $listen4 = new IO::Socket::INET(Listen => 1,
             LocalPort => $port,
             ReuseAddr => 1,
             Proto => 'tcp');
 }
-die "Can't listen on port " . $port . ": $!" unless $listen;
+die "Can't listen on port " . $port . ": $!" unless ($listen4 || $listen6);
 
 sub ip6bin {
     my $ip = shift;
@@ -325,7 +327,8 @@ sub ip6bin {
     pack('S>*', map { hex } (@left, @mid, @right));
 }
 
-my $sel = new IO::Select($listen);
+my $sel = new IO::Select($listen4);
+$sel->add($listen6);
 
 if ($daemon) {
     chdir "/" or die "Could not chdir to '/': $!";
@@ -487,8 +490,10 @@ sub performSqueezeboxSetup {
 while (1) {
     my @waiting = $sel->can_read;
     foreach my $fh (@waiting) {
-        if ($fh==$listen) {
-            my $new = $listen->accept;
+        if (
+	(defined($listen4) && ($fh==$listen4)) ||
+	(defined($listen6) && ($fh==$listen6))) {
+            my $new = $fh->accept;
             printf "New connection from %s\n", $new->sockhost if $verbose;
 
             $sel->add($new);

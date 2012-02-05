@@ -398,38 +398,76 @@ void buffer_put_packet(seq_t seqno, char *data, int len) {
     }
 }
 
-static int rtp_sockets[2];  // data, control
+static int rtp_sockets[4];  // data, control
 #ifdef AF_INET6
-    struct sockaddr_in6 rtp_client;
-#else
-    struct sockaddr_in rtp_client;
+    struct sockaddr_in6 rtp_client6;
 #endif
+struct sockaddr_in rtp_client4;
+
+struct sockaddr *rtp_client;
+socklen_t si_len;
 
 void *rtp_thread_func(void *arg) {
-    socklen_t si_len = sizeof(rtp_client);
     char packet[MAX_PACKET];
     char *pktp;
     seq_t seqno;
     ssize_t plen;
-    int sock = rtp_sockets[0], csock = rtp_sockets[1];
-    int readsock;
+    int sock4 = rtp_sockets[0], csock4 = rtp_sockets[1];
+    int sock6 = rtp_sockets[2], csock6 = rtp_sockets[3];
+    int nfds;
     char type;
 
     fd_set fds;
     FD_ZERO(&fds);
-    FD_SET(sock, &fds);
-    FD_SET(csock, &fds);
+    FD_SET(sock4, &fds);
+    FD_SET(csock4, &fds);
+    nfds = csock4 > sock4 ? csock4 : sock4;
 
-    while (select(csock>sock ? csock+1 : sock+1, &fds, 0, 0, 0)!=-1) {
-        if (FD_ISSET(sock, &fds)) {
-            readsock = sock;
-        } else {
-            readsock = csock;
+#ifdef AF_INET6
+    FD_SET(sock6, &fds);
+    FD_SET(csock6, &fds);
+    nfds = sock6 > nfds ? sock6 : nfds;
+    nfds = csock6 > nfds ? csock6 : nfds;
+#endif
+
+    nfds++;
+
+    while (select(nfds, &fds, 0, 0, 0)!=-1) {
+        int readsock;
+
+        if (FD_ISSET(sock4, &fds)) {
+            readsock = sock4;
+	    rtp_client = (struct sockaddr*)&rtp_client4;
+	    si_len = sizeof(rtp_client4);
         }
-        FD_SET(sock, &fds);
-        FD_SET(csock, &fds);
+	else if (FD_ISSET(csock4, &fds)) {
+            readsock = csock4;
+	    rtp_client = (struct sockaddr*)&rtp_client4;
+	    si_len = sizeof(rtp_client4);
+        }
+#ifdef AF_INET6
+	else if (FD_ISSET(sock6, &fds)) {
+            readsock = sock6;
+	    rtp_client = (struct sockaddr*)&rtp_client6;
+	    si_len = sizeof(rtp_client6);
+	}
+	else if (FD_ISSET(csock6, &fds)) {
+            readsock = csock6;
+	    rtp_client = (struct sockaddr*)&rtp_client6;
+	    si_len = sizeof(rtp_client6);
+	}
+        FD_SET(sock6, &fds);
+        FD_SET(csock6, &fds);
+#endif
 
-        plen = recvfrom(readsock, packet, sizeof(packet), 0, (struct sockaddr*)&rtp_client, &si_len);
+        FD_SET(sock4, &fds);
+        FD_SET(csock4, &fds);
+
+        plen = recvfrom(readsock, packet, sizeof(packet), 0, rtp_client, &si_len);
+	if (readsock == sock6)
+	{
+		fprintf(stderr, "%d %d ", plen, errno);
+	}
         if (plen < 0)
             continue;
         assert(plen<=MAX_PACKET);
@@ -462,37 +500,34 @@ void rtp_request_resend(seq_t first, seq_t last) {
     *(unsigned short *)(req+4) = htons(first);  // missed seqnum
     *(unsigned short *)(req+6) = htons(last-first+1);  // count
 
+    int csock = rtp_sockets[1];
+    rtp_client4.sin_port = htons(controlport);
+
 #ifdef AF_INET6
-    rtp_client.sin6_port = htons(controlport);
-#else
-    rtp_client.sin_port = htons(controlport);
+    if (rtp_client == (struct sockaddr*)&rtp_client6)
+	    csock = rtp_sockets[3];
+
+    rtp_client6.sin6_port = htons(controlport);
 #endif
-    sendto(rtp_sockets[1], req, sizeof(req), 0, (struct sockaddr *)&rtp_client, sizeof(rtp_client));
+
+    sendto(csock, req, sizeof(req), 0, rtp_client, si_len);
 }
 
 
 int init_rtp(void) {
     struct sockaddr_in si;
-    int type = AF_INET;
-	struct sockaddr* si_p = (struct sockaddr*)&si;
-	socklen_t si_len = sizeof(si);
-    unsigned short *sin_port = &si.sin_port;
     memset(&si, 0, sizeof(si));
-#ifdef AF_INET6
-    struct sockaddr_in6 si6;
-    type = AF_INET6;
-	si_p = (struct sockaddr*)&si6;
-	si_len = sizeof(si6);
-    sin_port = &si6.sin6_port;
-    memset(&si6, 0, sizeof(si6));
-#endif
 
     si.sin_family = AF_INET;
 #ifdef SIN_LEN
 	si.sin_len = sizeof(si);
 #endif
     si.sin_addr.s_addr = htonl(INADDR_ANY);
+
 #ifdef AF_INET6
+    struct sockaddr_in6 si6;
+    memset(&si6, 0, sizeof(si6));
+
     si6.sin6_family = AF_INET6;
     #ifdef SIN6_LEN
         si6.sin6_len = sizeof(si);
@@ -501,12 +536,28 @@ int init_rtp(void) {
     si6.sin6_flowinfo = 0;
 #endif
 
-    int sock = -1, csock = -1;    // data and control (we treat the streams the same here)
+    int sock4 = -1, csock4 = -1;    // data and control (we treat the streams the same here)
+    int sock6 = -1, csock6 = -1;
+
     unsigned short port = 6000;
     while(1) {
-        if(sock < 0)
-            sock = socket(type, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock4 < 0)
+            sock4 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock4==-1)
+            die("Can't create IPv4 data socket!");
+
+        if(csock4 < 0)
+            csock4 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (csock4==-1)
+            die("Can't create control socket!");
+
+        si.sin_port = htons(port);
+	int bind1 = bind(sock4, (struct sockaddr*)&si, sizeof(si));
+        si.sin_port = htons(port + 1);
+	int bind2 = bind(csock4, (struct sockaddr*)&si, sizeof(si));
+
 #ifdef AF_INET6
+#if 0
 	    if(sock==-1 && type == AF_INET6) {
 	        // try fallback to IPv4
 	        type = AF_INET;
@@ -516,22 +567,42 @@ int init_rtp(void) {
 	        continue;
 	    }
 #endif
-        if (sock==-1)
-            die("Can't create data socket!");
+        if (sock6 < 0)
+            sock6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock6==-1)
+            die("Can't create IPv6 data socket!");
 
-        if(csock < 0)
-            csock = socket(type, SOCK_DGRAM, IPPROTO_UDP);
-        if (csock==-1)
-            die("Can't create control socket!");
+        if(csock6 < 0)
+            csock6 = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+        if (csock6==-1)
+            die("Can't create IPv6 control socket!");
 
-        *sin_port = htons(port);
-        int bind1 = bind(sock, si_p, si_len);
-        *sin_port = htons(port + 1);
-        int bind2 = bind(csock, si_p, si_len);
+	int option = 1;
+	setsockopt(sock6, IPPROTO_IPV6, IPV6_V6ONLY, &option, sizeof(option));
+	setsockopt(csock6, IPPROTO_IPV6, IPV6_V6ONLY, &option, sizeof(option));
 
+        si6.sin6_port = htons(port);
+	int bind3 = bind(sock6, (struct sockaddr*)&si6, sizeof(si6));
+        si6.sin6_port = htons(port + 1);
+	int bind4 = bind(csock6, (struct sockaddr*)&si6, sizeof(si6));
+
+	if(bind1 == 0 && bind2 == 0 &&
+           bind3 == 0 && bind4 == 0)
+	{
+		break;
+	}
+	else
+	{
+		if(bind1 == 0) { close(sock4); sock4 = -1; }
+		if(bind2 == 0) { close(csock4); csock4 = -1; }
+		if(bind3 == 0) { close(sock6); sock6 = -1; }
+		if(bind4 == 0) { close(csock6); csock6 = -1; }
+	}
+#else
         if(bind1 != -1 && bind2 != -1) break;
-        if(bind1 != -1) { close(sock); sock = -1; }
-        if(bind2 != -1) { close(csock); csock = -1; }
+        if(bind1 != -1) { close(sock4); sock4 = -1; }
+        if(bind2 != -1) { close(csock4); csock4 = -1; }
+#endif
 
         port += 3;
     }
@@ -540,8 +611,12 @@ int init_rtp(void) {
     printf("cport: %d\n", port+1);
 
     pthread_t rtp_thread;
-    rtp_sockets[0] = sock;
-    rtp_sockets[1] = csock;
+    rtp_sockets[0] = sock4;
+    rtp_sockets[1] = csock4;
+#ifdef AF_INET6
+    rtp_sockets[2] = sock6;
+    rtp_sockets[3] = csock6;
+#endif
     pthread_create(&rtp_thread, NULL, rtp_thread_func, (void *)rtp_sockets);
 
     return port;
